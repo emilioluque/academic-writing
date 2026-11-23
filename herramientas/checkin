@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# checkin: el check-in diario de escritura. Solo necesita bash y git.
+#
+#   checkin              hacer el check-in ahora
+#   checkin --resumen    ver las dos últimas semanas sin responder nada
+#   checkin --si-toca    solo si es día y hora de aviso y aún no está hecho
+#                        (lo llama tu .bashrc / .zshrc al abrir un terminal)
+#   checkin --ventana    igual, pero espera Enter al final (Programador de tareas)
+#   checkin --instalar   dejarlo preparado en este equipo (una vez por equipo)
+#
+# Sin rachas a propósito: una racha que vuelve a cero castiga el día perdido.
+# La medida es la del plan: días de aviso con escritura, de cada diez.
+#
+# Escribe en la raíz del repositorio (la carpeta que contiene herramientas/):
+#   registro-checkin.md  una entrada por día: sí/no, minutos, pieza, plan
+#   evitacion.md         la línea de evitación, solo si decides apuntarla
+# y lee registro-sesiones.md, que llena :Borrador en Neovim.
+
+# ---- Ajustes ------------------------------------------------------------
+HORA="19:35"         # desde qué hora pregunta
+DIAS="1 2 3 4 5"     # días de aviso: 1 = lunes ... 7 = domingo
+SUBIR=1              # 1 = commit y push del registro al terminar
+TRAER=1              # 1 = git pull antes de preguntar (¿ya lo hiciste en otro equipo?)
+# -------------------------------------------------------------------------
+
+set -u
+AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$AQUI/.." && pwd)"
+CHECKIN="$REPO/registro-checkin.md"
+SESIONES="$REPO/registro-sesiones.md"
+EVITACION="$REPO/evitacion.md"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/checkin"
+
+NOMBRES=(x lunes martes miércoles jueves viernes sábado domingo)
+LETRAS=(x L M X J V S D)
+MESES=(x enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre)
+
+if [ -t 1 ] && [ -z "${NO_COLOR-}" ]; then
+  B=$'\e[1m'; T=$'\e[2m'; V=$'\e[32m'; R=$'\e[0m'
+  # en las preguntas, los códigos van entre \001 y \002 para que readline no se líe
+  PB=$'\001\e[1m\002'; PT=$'\001\e[2m\002'; PR=$'\001\e[0m\002'
+else
+  B=""; T=""; V=""; R=""; PB=""; PT=""; PR=""
+fi
+
+# Fechas en bash puro (abrir procesos es lento en Git Bash para Windows).
+# Días desde 1970-01-01 <-> fecha civil, según el algoritmo de H. Hinnant.
+dias_desde_civil() {  # dias_desde_civil AAAA MM DD  -> deja el número en DN
+  local y=$((10#$1)) m=$((10#$2)) d=$((10#$3)) era yoe mp doy doe
+  [ "$m" -le 2 ] && y=$((y - 1))
+  era=$(( (y >= 0 ? y : y - 399) / 400 ))
+  yoe=$(( y - era * 400 ))
+  mp=$(( (m + 9) % 12 ))
+  doy=$(( (153 * mp + 2) / 5 + d - 1 ))
+  doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+  DN=$(( era * 146097 + doe - 719468 ))
+}
+fecha() {  # fecha DESPLAZAMIENTO  -> FECHA (AAAA-MM-DD) y DSEM (1 = lunes)
+  local n=$((HOYN + $1)) z era doe yoe y doy mp d m
+  z=$((n + 719468))
+  era=$(( (z >= 0 ? z : z - 146096) / 146097 ))
+  doe=$(( z - era * 146097 ))
+  yoe=$(( (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 ))
+  y=$(( yoe + era * 400 ))
+  doy=$(( doe - (365 * yoe + yoe / 4 - yoe / 100) ))
+  mp=$(( (5 * doy + 2) / 153 ))
+  d=$(( doy - (153 * mp + 2) / 5 + 1 ))
+  m=$(( mp < 10 ? mp + 3 : mp - 9 ))
+  [ "$m" -le 2 ] && y=$((y + 1))
+  printf -v FECHA '%04d-%02d-%02d' "$y" "$m" "$d"
+  DSEM=$(( ((n % 7) + 7 + 3) % 7 + 1 ))
+}
+
+HOY="$(date +%F)"
+DIA_HOY="$(date +%u)"
+dias_desde_civil "${HOY:0:4}" "${HOY:5:2}" "${HOY:8:2}"; HOYN=$DN
+
+# Las cabeceras del registro, leídas una vez y buscadas en memoria
+CABS=""
+leer_cabeceras() { CABS=$'\n'"$(grep '^## ' "$CHECKIN" 2>/dev/null | tr -d '\r')"$'\n'; }
+entrada_de() {  # -> ENT = la cabecera de ese día, o vacío
+  local resto
+  ENT=""
+  case $CABS in *$'\n'"## $1 "*) ;; *) return 0 ;; esac
+  resto="${CABS#*$'\n'"## $1 "}"
+  ENT="## $1 ${resto%%$'\n'*}"
+}
+es_dia_de_aviso() { case " $DIAS " in *" $1 "*) return 0 ;; esac; return 1; }
+estado_de() {  # -> EST = si | no | (vacío)
+  entrada_de "$1"
+  case $ENT in *" · sí"*) EST=si ;; *" · no"*) EST=no ;; *) EST="" ;; esac
+}
+minutos_de() {  # -> MIN
+  local re=' · ([0-9]+) min'; entrada_de "$1"
+  if [[ $ENT =~ $re ]]; then MIN="${BASH_REMATCH[1]}"; else MIN=0; fi
+}
+ya_es_hora() {
+  local ahora h
+  ahora="$(date +%H%M)"; h="${HORA/:/}"
+  [ $((10#$ahora)) -ge $((10#$h)) ]
+}
+
+pregunta() {  # pregunta "texto" [valor por defecto]  -> deja la respuesta en RESP
+  local p="$1"
+  [ -n "${2-}" ] && p="$p ${PT}[$2]${PR}"
+  RESP=""
+  IFS= read -e -r -p "$p: " RESP || RESP=""
+  [ -z "$RESP" ] && RESP="${2-}"
+  return 0
+}
+si_no() {  # si_no "texto" s|n  -> 0 si sí
+  local d="$2" op="[s/N]"
+  [ "$d" = s ] && op="[S/n]"
+  IFS= read -e -r -p "$1 $op: " RESP || RESP=""
+  [ -z "$RESP" ] && RESP="$d"
+  case $RESP in s|S|si|sí|Si|Sí|y|Y) return 0 ;; esac
+  return 1
+}
+
+traer() {
+  [ "$TRAER" = 1 ] || return 0
+  git -C "$REPO" rev-parse >/dev/null 2>&1 || return 0
+  printf '%s' "${T}Trayendo el registro de otros equipos...${R} "
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30 git -C "$REPO" pull -q --rebase --autostash >/dev/null 2>&1
+  else
+    git -C "$REPO" pull -q --rebase --autostash >/dev/null 2>&1
+  fi
+  printf '\r\033[K'
+}
+
+asegurar_atributos() {
+  # Los registros solo crecen por el final: si dos equipos añaden a la vez,
+  # git junta las dos versiones en lugar de declarar un conflicto.
+  local f="$REPO/.gitattributes" l
+  # Y el script viaja siempre con finales de línea LF: con core.autocrlf,
+  # Windows lo sacaría con CRLF y bash no podría leerlo.
+  for l in "registro-checkin.md merge=union" "registro-sesiones.md merge=union" "evitacion.md merge=union" "herramientas/* text eol=lf"; do
+    grep -qxF "$l" "$f" 2>/dev/null || printf '%s\n' "$l" >> "$f"
+  done
+}
+
+subir() {
+  [ "$SUBIR" = 1 ] || return 0
+  git -C "$REPO" rev-parse >/dev/null 2>&1 || return 0
+  asegurar_atributos
+  local archivos=(registro-checkin.md .gitattributes)
+  [ -f "$EVITACION" ] && archivos+=(evitacion.md)
+  git -C "$REPO" add -- "${archivos[@]}"
+  git -C "$REPO" commit -q -m "check-in $HOY" -- "${archivos[@]}" >/dev/null 2>&1 || return 0
+  printf '%s' "${T}Subiendo el registro...${R} "
+  if git -C "$REPO" pull -q --rebase --autostash >/dev/null 2>&1 && git -C "$REPO" push -q >/dev/null 2>&1; then
+    echo "hecho."
+  else
+    echo "no he podido; se subirá con tu próximo guarda."
+  fi
+}
+
+quitar_hoy() {
+  local tmp="$CHECKIN.tmp" dentro=0 l
+  while IFS= read -r l || [ -n "$l" ]; do
+    case $l in
+      "## $HOY "*) dentro=1; continue ;;
+      "## "*) dentro=0 ;;
+    esac
+    [ "$dentro" = 1 ] || printf '%s\n' "$l"
+  done < "$CHECKIN" > "$tmp" && mv "$tmp" "$CHECKIN"
+}
+
+ultima_pieza() {
+  local e campo
+  e="$(grep '^## .* · sí' "$CHECKIN" 2>/dev/null | tail -n 1)"
+  [ -z "$e" ] && return
+  campo="${e##* · }"
+  case $campo in *min|*palabras|sí) ;; *) echo "$campo" ;; esac
+}
+
+resumen() {
+  local i linea1="" linea2="" hechos=0 posibles=0 semana=0
+  leer_cabeceras
+  for ((i = 13; i >= 0; i--)); do
+    fecha -$i; estado_de "$FECHA"
+    linea1="$linea1${LETRAS[$DSEM]} "
+    case $EST in
+      si) linea2="$linea2${V}■${R} " ;;
+      no) linea2="$linea2□ " ;;
+      *) if es_dia_de_aviso "$DSEM" && [ "$i" -gt 0 ]; then linea2="$linea2${T}·${R} "; else linea2="$linea2  "; fi ;;
+    esac
+    if es_dia_de_aviso "$DSEM" && { [ "$i" -gt 0 ] || [ -n "$EST" ]; }; then
+      posibles=$((posibles + 1))
+      [ "$EST" = si ] && hechos=$((hechos + 1))
+    fi
+  done
+  # Minutos desde el lunes
+  for ((i = 0; i < DIA_HOY; i++)); do
+    fecha -$i; minutos_de "$FECHA"; semana=$((semana + MIN))
+  done
+  echo
+  echo "${B}Últimas dos semanas${R}"
+  echo "  $linea1"
+  echo "  $linea2"
+  echo "  ${T}■ escrito   □ no   · sin respuesta${R}"
+  echo "  Días de aviso con escritura: ${B}$hechos de $posibles${R} · esta semana: ${B}$semana min${R}"
+}
+
+checkin() {
+  mkdir -p "$CACHE"
+  [ -f "$CHECKIN" ] || printf '# Check-in de escritura\n\n' > "$CHECKIN"
+
+  local dia_mes mes
+  dia_mes="$(date +%d)"; mes="$(date +%m)"
+  echo
+  echo "${B}Check-in · ${NOMBRES[$DIA_HOY]} $((10#$dia_mes)) de ${MESES[$((10#$mes))]}${R}"
+
+  leer_cabeceras; entrada_de "$HOY"
+  if [ -n "$ENT" ]; then
+    echo "Ya hay check-in de hoy: ${ENT#"## $HOY ${NOMBRES[$DIA_HOY]} · "}"
+    if si_no "¿Rehacerlo?" n; then quitar_hoy; else resumen; return 0; fi
+  fi
+
+  # Lo que te propusiste la última vez
+  local plan
+  plan="$(grep '^- Siguiente' "$CHECKIN" | tail -n 1 | tr -d '\r')"
+  [ -n "$plan" ] && echo "${T}Te habías propuesto${R} ${plan#- Siguiente }"
+
+  # Lo que registró :Borrador hoy
+  local l re='^- ([0-9-]+) [0-9:]+ · (.*) · ([0-9]+) min · ([+-]?[0-9]+) palabras'
+  local n_ses=0 min_ses=0 pal_ses=0 pieza_ses="" w
+  if [ -f "$SESIONES" ]; then
+    while IFS= read -r l; do
+      l="${l%$'\r'}"
+      if [[ $l =~ $re ]] && [ "${BASH_REMATCH[1]}" = "$HOY" ]; then
+        n_ses=$((n_ses + 1))
+        min_ses=$((min_ses + BASH_REMATCH[3]))
+        w="${BASH_REMATCH[4]}"; pal_ses=$((pal_ses + ${w#+}))
+        pieza_ses="${BASH_REMATCH[2]##*/}"
+      fi
+    done < "$SESIONES"
+  fi
+  if [ "$n_ses" -gt 0 ]; then
+    local s="sesión"; [ "$n_ses" -gt 1 ] && s="sesiones"
+    printf '%s\n' "${T}:Borrador registró hoy${R} $n_ses $s: $min_ses min, $(printf '%+d' "$pal_ses") palabras ($pieza_ses)."
+  fi
+
+  local def=""; [ "$n_ses" -gt 0 ] && def=s
+  local op="[s/n, p = ahora no]"; [ -n "$def" ] && op="[S/n, p = ahora no]"
+  echo
+  IFS= read -e -r -p "${PB}¿Has escrito hoy?${PR} $op: " RESP || RESP=""
+  [ -z "$RESP" ] && RESP="$def"
+  local escrito
+  case $RESP in
+    s|S|si|sí|Si|Sí|y|Y) escrito=si ;;
+    n|N|no|No) escrito=no ;;
+    p|P)
+      touch "$CACHE/pospuesto-$HOY"
+      echo "Vale. Hoy no te lo vuelvo a preguntar en este equipo; escribe checkin cuando quieras."
+      return 0 ;;
+    *) echo "No he entendido la respuesta; vuelve a escribir checkin."; return 1 ;;
+  esac
+
+  local cabecera="## $HOY ${NOMBRES[$DIA_HOY]}" cuerpo=""
+  if [ "$escrito" = si ]; then
+    local mins="" pal pieza vivo dm=""
+    [ "$min_ses" -gt 0 ] && dm="$min_ses"
+    while :; do
+      pregunta "¿Cuántos minutos, más o menos?" "$dm"; mins="$RESP"
+      [[ $mins =~ ^[0-9]+$ ]] && break
+      echo "  Un número, por favor (puede ser aproximado)."
+    done
+    local dp=""; [ "$n_ses" -gt 0 ] && dp="$(printf '%+d' "$pal_ses")"
+    pregunta "¿Palabras? ${PT}(Enter salta)${PR}" "$dp"; pal="${RESP#+}"
+    local dpz="$pieza_ses"; [ -z "$dpz" ] && dpz="$(ultima_pieza)"
+    pregunta "¿En qué pieza?" "$dpz"; pieza="$RESP"
+    pregunta "En una línea, ¿qué está vivo en lo que has escrito? ${PT}(Enter salta)${PR}"; vivo="$RESP"
+    cabecera="$cabecera · sí · $mins min"
+    [[ $pal =~ ^-?[0-9]+$ ]] && cabecera="$cabecera · $(printf '%+d' "$pal") palabras"
+    [ -n "$pieza" ] && cabecera="$cabecera · $pieza"
+    [ -n "$vivo" ] && cuerpo="$cuerpo- Vivo: $vivo"$'\n'
+    echo "${V}Anotado.${R} Lo que cuenta hoy es haberte sentado; la calidad se juzga otro día."
+  else
+    cabecera="$cabecera · no"
+    echo "Anotado. Un día sin escribir es un dato, no un veredicto. La próxima vez, la sesión"
+    echo "normal: no una más larga para compensar."
+    if si_no "¿Apuntas la evitación en evitacion.md?" n; then
+      local hora tarea sent pens lugar
+      pregunta "  ¿A qué hora, más o menos?" "$(date +%H:%M)"; hora="$RESP"
+      pregunta "  ¿Qué tarea?" "$(ultima_pieza)"; tarea="$RESP"
+      pregunta "  ¿Qué sentiste, en una palabra?"; sent="$RESP"
+      pregunta "  ¿Qué pensaste, en una frase?"; pens="$RESP"
+      pregunta "  ¿Qué hiciste en su lugar?"; lugar="$RESP"
+      printf -- '- %s %s · %s · %s · "%s" · %s\n' "$HOY" "$hora" "$tarea" "$sent" "$pens" "$lugar" >> "$EVITACION"
+      echo "  Apuntado. Sin análisis por ahora: solo recoges."
+    fi
+  fi
+
+  # Intención de implementación para la próxima sesión
+  local i u prox=""
+  for i in 1 2 3 4 5 6 7; do
+    fecha $i; u=$DSEM
+    if es_dia_de_aviso "$u"; then
+      if [ "$i" = 1 ]; then prox="mañana, ${NOMBRES[$u]}"; else prox="el ${NOMBRES[$u]}"; fi
+      break
+    fi
+  done
+  [ -z "$prox" ] && prox="la próxima vez"
+  echo
+  echo "${B}Próxima sesión ($prox)${R}"
+  local cuando paso
+  pregunta "  ¿Cuándo y dónde? ${PT}(p. ej. 8:00, mesa del salón; Enter salta)${PR}"; cuando="$RESP"
+  pregunta "  ¿Primer paso, de menos de cinco minutos? ${PT}(p. ej. abrir cap2.md y escribir una frase mala)${PR}"; paso="$RESP"
+  if [ -n "$cuando$paso" ]; then
+    cuerpo="$cuerpo- Siguiente ($prox): ${cuando:-?} → ${paso:-empezar}"$'\n'
+    echo "  ${T}Plan:${R} ${cuando:-?} → ${paso:-empezar}"
+  fi
+
+  { printf '%s\n' "$cabecera"; printf '%s' "$cuerpo"; printf '\n'; } >> "$CHECKIN"
+  resumen
+  echo
+  subir
+}
+
+instalar() {
+  local script="$AQUI/checkin" rc marca="# >>> checkin >>>"
+  local bloque
+  bloque="$marca
+alias checkin='bash \"$script\"'
+[ -z \"\${BASH_EXECUTION_STRING-}\" ] && bash \"$script\" --si-toca
+# <<< checkin <<<"
+  echo "${B}Preparando checkin en este equipo${R}"
+  echo "Repositorio: $REPO"
+  [ -f "$SESIONES" ] || echo "${T}(Aún no hay registro-sesiones.md aquí: comprueba que init.lua apunta a esta carpeta.)${R}"
+
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ "$rc" = "$HOME/.zshrc" ] && [ ! -f "$rc" ]; then
+      case ${SHELL-} in *zsh) ;; *) continue ;; esac
+    fi
+    if grep -qF "$marca" "$rc" 2>/dev/null; then
+      echo "  $rc ya lo tenía."
+    else
+      printf '\n%s\n' "$bloque" >> "$rc"
+      echo "  Añadido a $rc: la orden checkin y el aviso al abrir un terminal."
+    fi
+  done
+  asegurar_atributos
+  echo "  .gitattributes: los registros se unen sin conflictos entre equipos."
+
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if si_no "¿Programo el aviso de las $HORA en el Programador de tareas de Windows?" s; then
+        local gb ps dias="" d
+        gb="$(cygpath -w /git-bash.exe 2>/dev/null)"; [ -z "$gb" ] && gb='C:\Program Files\Git\git-bash.exe'
+        for d in $DIAS; do
+          case $d in 1) d=Monday ;; 2) d=Tuesday ;; 3) d=Wednesday ;; 4) d=Thursday ;; 5) d=Friday ;; 6) d=Saturday ;; 7) d=Sunday ;; esac
+          dias="$dias${dias:+,}'$d'"
+        done
+        ps="${TMPDIR:-/tmp}/checkin-tarea.ps1"
+        cat > "$ps" <<EOF
+\$ErrorActionPreference = 'Stop'
+\$accion = New-ScheduledTaskAction -Execute '$gb' -Argument '-c "bash ''$script'' --ventana"'
+\$disparo = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dias -At '$HORA'
+\$ajustes = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'Check-in escritura' -Action \$accion -Trigger \$disparo -Settings \$ajustes -Force | Out-Null
+EOF
+        if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ps")"; then
+          echo "  Tarea «Check-in escritura» creada: a las $HORA se abrirá una ventana con el check-in."
+        else
+          echo "  No he podido crear la tarea; prueba a ejecutar esto mismo desde un Git Bash normal."
+        fi
+        rm -f "$ps"
+      fi
+      echo
+      echo "Para PowerShell, abre ${B}notepad \$PROFILE${R} y pega estas dos líneas:"
+      echo
+      echo "function checkin { & \"\$env:ProgramFiles\\Git\\bin\\bash.exe\" -l -c \"bash '$script' \$args\" }"
+      echo "if ((Get-Date -Format HHmm) -ge '${HORA/:/}') { & \"\$env:ProgramFiles\\Git\\bin\\bash.exe\" -l -c \"bash '$script' --si-toca\" }"
+      ;;
+  esac
+  echo
+  echo "Listo. Abre un terminal nuevo y escribe ${B}checkin${R} para probarlo."
+}
+
+limpiar_pospuestos() {
+  local f
+  for f in "$CACHE"/pospuesto-*; do
+    [ -e "$f" ] && [ "$f" != "$CACHE/pospuesto-$HOY" ] && rm -f "$f"
+  done
+  return 0
+}
+
+toca() {
+  es_dia_de_aviso "$DIA_HOY" && ya_es_hora || return 1
+  leer_cabeceras; entrada_de "$HOY"
+  [ -z "$ENT" ] && [ ! -f "$CACHE/pospuesto-$HOY" ]
+}
+
+limpiar_pospuestos
+case "${1-}" in
+  "") checkin ;;
+  --resumen) resumen; echo ;;
+  --instalar) instalar ;;
+  --si-toca)
+    [ -t 0 ] && [ -t 1 ] || exit 0
+    toca || exit 0
+    traer
+    toca || exit 0
+    checkin ;;
+  --ventana)
+    toca || exit 0
+    traer
+    toca || exit 0
+    checkin
+    echo; IFS= read -r -p "Pulsa Enter para cerrar." _ ;;
+  -h|--help) sed -n '2,15p' "$AQUI/checkin" | sed 's/^# \{0,1\}//' ;;
+  *) echo "Opción desconocida: $1  (checkin --help)"; exit 1 ;;
+esac

@@ -1,0 +1,5 @@
+build/
+*.docx
+*.pdf
+*.epub
+.DS_Store
