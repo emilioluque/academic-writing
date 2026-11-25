@@ -60,13 +60,13 @@ def repositorios():
     if WINDOWS:
         local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
         roaming = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
-        fijos = [("Neovim", local / "nvim"), ("Pandoc", roaming / "pandoc")]
+        fijos = [("Neovim", local / "nvim"), ("pandoc-config", roaming / "pandoc")]
     else:
         config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
         datos = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
-        fijos = [("Neovim", config / "nvim"), ("Pandoc", datos / "pandoc")]
+        fijos = [("Neovim", config / "nvim"), ("pandoc-config", datos / "pandoc")]
         if not (datos / "pandoc").exists() and (home / ".pandoc").exists():
-            fijos[1] = ("Pandoc", home / ".pandoc")
+            fijos[1] = ("pandoc-config", home / ".pandoc")
     fijos.append(("bibliografia", home / "bibliografia"))
 
     vistos, lista = set(), []
@@ -179,11 +179,16 @@ def si_no(texto, defecto="s"):
 def poner_al_dia(nombre, repo, mensaje, solo_mirar=False):
     etiqueta = f"{B}{nombre:<18}{R}"
     if not repo.exists():
-        print(f"  {T}· {nombre:<18} no está en este equipo{R}")
+        print(f"  {T}· {nombre:<18} no está en este equipo (buscado en {repo}){R}")
         return "ausente"
     if not (repo / ".git").exists():
-        print(f"  {T}· {nombre:<18} no es un repositorio git ({repo}){R}")
-        return "ausente"
+        dentro = [d for d in repo.iterdir() if d.is_dir() and (d / ".git").exists()]
+        if dentro:
+            print(f"  {A}!{R} {etiqueta} el repositorio está un nivel más abajo, en {dentro[0]};"
+                  f" debería estar en {repo}")
+        else:
+            print(f"  {A}!{R} {etiqueta} la carpeta {repo} existe, pero no es un clon de git")
+        return "aviso"
     if rebase_a_medias(repo):
         print(f"  {Rj}✗{R} {etiqueta} tiene un pull a medias; resuélvelo antes (git status)")
         return "error"
